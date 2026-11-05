@@ -5,6 +5,9 @@
 <title>Leaf classifier · live camera</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="description" content="On-device leaf classifier. Runs entirely in your browser; the camera image never leaves your phone.">
+<!-- An empty inline icon: it stops the browser requesting /favicon.ico, which
+     would otherwise show up as an unexplained entry in the privacy audit. -->
+<link rel="icon" href="data:,">
 <!--
   ============================================================================
   LEAF CLASSIFIER - single file, plain JavaScript, no build step.
@@ -912,7 +915,10 @@ function renderQr() {
     $("qrUrlText").textContent = url;
     const link = $("qrLink");
     link.href = url; link.textContent = url;
-    const same = url.replace(/\/+$/, "") === location.href.replace(/\/+$/, "").split(/[?#]/)[0];
+    // Compare without the query string first, then without the trailing slash,
+    // so /mlr-ex08/?selfcheck still counts as the same page as /mlr-ex08/.
+    const here = location.href.split(/[?#]/)[0].replace(/\/+$/, "");
+    const same = url.replace(/\/+$/, "") === here;
     $("qrMatch").innerHTML = same
       ? '<span class="pill pass">MATCHES THIS PAGE</span> <span class="note">encoded QR URL = ' +
         'the URL you are reading (QR ' + meta.version + "×" + meta.modules + " modules, ECC level M, " +
