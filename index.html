@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Leaf classifier · live camera</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="On-device leaf classifier. Runs entirely in your browser; the camera image never leaves your phone.">
+<!--
+  ============================================================================
+  LEAF CLASSIFIER - single file, plain JavaScript, no build step.
+
+  WHAT THIS PAGE DOES
+    1. Opens the rear camera of the phone.
+    2. Crops the CENTRAL SQUARE of every frame.
+    3. Resizes that square to model_info.json's input_size (96 x 96).
+    4. Divides the RGB bytes by 255  ->  0..1
+    5. Standardizes each channel: (x - mean[c]) / std[c]
+    6. Lays the result out as CHW planar float32, shape 1 x 3 x 96 x 96.
+    7. Runs the exported ONNX model in WebAssembly, on this device.
+    8. Applies softmax (the exported model ends in Gemm and emits LOGITS,
+       it contains no SoftMax node) and shows every class probability.
+
+  EVERY URL THIS PAGE LOADS - nothing else, and no image data is ever sent
+  anywhere. See the "Privacy audit" panel at the bottom for a live list.
+    https://cdn.jsdelivr.net/npm/onnxruntime-web@...   the ONNX Runtime WASM
+                                                        engine (third-party JS)
+    ./model_info.json    same origin: classes, input size, mean, std
+    ./leaf_model.onnx    same origin: the model weights
+    ./check_image.jpg    same origin: only for the self-check below
+    ./check_expected.json same origin: only for the self-check below
+  All fetch() calls on this page are GETs of these local static files.
+  There is no POST, no upload, no analytics, no telemetry. Frames are read
+  into a canvas and turned into a Float32Array that goes straight into the
+  WASM session.
+  ============================================================================
+-->
+<style>
+  :root {
+    --bg: #0e1512;
+    --panel: #18221d;
+    --line: #2a3a32;
+    --text: #e8f0ec;
+    --dim: #93a89e;
+    --accent: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(12px, env(safe-area-inset-top)) 12px calc(24px + env(safe-area-inset-bottom));
+    max-width: 640px; margin: 0 auto;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1 { font-size: 19px; margin: 4px 0 2px; letter-spacing: .2px; }
+  h2 { font-size: 14px; margin: 0 0 8px; color: var(--dim); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .07em; }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 12px; padding: 12px; margin: 0 0 12px; }
+  video {
+    display: block; width: 100%; aspect-ratio: 1 / 1; background: #000;
+    border-radius: 10px; object-fit: cover; touch-action: none;
+  }
+  .cropbox { position: relative; }
+  /* Shows exactly which part of the picture is fed to the network. */
+  .cropbox::after {
+    content: ""; position: absolute; inset: 12%; pointer-events: none;
+    border: 2px dashed rgba(255,255,255,.75); border-radius: 6px;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,.30);
+  }
+  .crolabel { position: absolute; left: 12%; bottom: calc(12% - 20px);
+              font-size: 11px; color: #fff; text-shadow: 0 1px 3px #000; }
+  button, .filelabel {
+    appearance: none; border: 0; border-radius: 10px; padding: 13px 16px;
+    font: inherit; font-weight: 600; background: var(--accent); color: #06231a;
+    cursor: pointer; width: 100%; display: block; text-align: center;
+  }
+  button.secondary, .filelabel { background: #263830; color: var(--text);
+    border: 1px solid var(--line); font-weight: 500; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 150px; }
+  input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .bar { margin: 0 0 9px; }
+  .bar:last-child { margin-bottom: 0; }
+  .barhead { display: flex; justify-content: space-between; font-size: 15px;
+             font-variant-numeric: tabular-nums; margin-bottom: 3px; }
+  .barhead .nm { font-weight: 600; }
+  .barhead .pc { color: var(--dim); }
+  .track { height: 9px; background: #0b110e; border-radius: 99px; overflow: hidden; }
+  .fill { height: 100%; width: 0%; background: var(--accent); border-radius: 99px;
+          transition: width .12s linear; }
+  .bar.top .pc { color: var(--text); }
+  .status { font-size: 13px; color: var(--dim); min-height: 18px; }
+  .status.err { color: #fca5a5; }
+  .status.ok { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px;
+          font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 4px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 12px; word-break: break-all; }
+  .qr { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  canvas#qr { background: #fff; border-radius: 6px; width: 172px; height: 172px;
+              image-rendering: pixelated; flex: 0 0 auto; }
+  .qr .txt { flex: 1 1 190px; min-width: 190px; }
+  .qr a { color: var(--accent); }
+  ul.urls { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--dim);
+            word-break: break-all; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 99px;
+          font-size: 12px; font-weight: 700; }
+  .pill.pass { background: #14532d; color: #bbf7d0; }
+  .pill.fail { background: #7f1d1d; color: #fecaca; }
+  .note { font-size: 12px; color: var(--dim); }
+  details summary { cursor: pointer; color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Leaf classifier · live camera</h1>
+<p class="sub">MobileNetV3 · 4 classes · runs in your browser, on your phone.
+Nothing is uploaded.</p>
+
+<div class="panel">
+  <div class="cropbox">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="crolabel">dashed square = what the model sees</div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button id="startBtn">Start camera</button>
+    <button id="stopBtn" class="secondary" disabled>Stop</button>
+  </div>
+  <div class="status" id="camStatus" style="margin-top:8px">Camera is off.</div>
+</div>
+
+<div class="panel">
+  <h2>Probabilities</h2>
+  <div id="bars"></div>
+  <div class="status" id="inferStatus">Waiting for a first prediction…</div>
+</div>
+
+<div class="panel">
+  <h2>No camera? Use a photo</h2>
+  <div class="row">
+    <label class="filelabel" for="fileInput">Choose / take a photo</label>
+    <input type="file" id="fileInput" accept="image/*">
+    <button id="checkBtn" class="secondary">Run built-in self-check</button>
+  </div>
+  <p class="note" id="fileStatus" style="margin-bottom:0">The photo is decoded
+    locally by your browser and never uploaded.</p>
+</div>
+
+<div class="panel">
+  <h2>Self-check: check_image.jpg vs check_expected.json</h2>
+  <div id="checkOut" class="note">Press <em>Run built-in self-check</em> to compare
+    this page's probabilities with <span class="mono">check_expected.json</span>.</div>
+</div>
+
+<div class="panel">
+  <h2>Privacy audit — every request this page made</h2>
+  <button id="auditBtn" class="secondary">List every URL loaded / requested</button>
+  <div id="auditOut" style="margin-top:8px" class="note">Nothing listed yet.</div>
+</div>
+
+<div class="panel">
+  <h2>Open this page on a phone — scan me</h2>
+  <div class="qr">
+    <canvas id="qr" width="296" height="296" aria-label="QR code of this page's URL"></canvas>
+    <div class="txt">
+      <div style="font-size:13px;color:var(--dim);margin-bottom:4px">The QR below encodes
+        exactly this URL (drawn by the encoder inside this file — no QR web service):</div>
+      <div class="mono" id="qrUrlText">…</div>
+      <div style="margin-top:8px"><a id="qrLink" href="#">Open the same link</a></div>
+      <div class="note" id="qrMatch" style="margin-top:8px"></div>
+      <div style="margin-top:8px"><button id="qrScanBtn" class="secondary">Decode my own QR
+          to prove it</button></div>
+      <div class="note" id="qrScanOut" style="margin-top:8px"></div>
+    </div>
+  </div>
+</div>
+
+<details class="panel">
+  <summary>Preprocessing actually used (for REVIEW.md)</summary>
+  <p class="note">Read from <span class="mono">model_info.json</span> at run time:
+    <span class="mono" id="infoEcho">…</span></p>
+  <p class="note">Per frame, in <span class="mono">preprocess()</span>:
+    side = min(videoWidth, videoHeight); source rect = the centred
+    side&times;side square; <span class="mono">drawImage()</span> into a 96&times;96
+    canvas; <span class="mono">getImageData()</span> gives RGBA bytes; then for each
+    pixel <span class="mono">c_ch = (byte/255 − mean[ch]) / std[ch]</span> written
+    planar R-plane, G-plane, B-plane (CHW) into a Float32Array of length
+    3&times;96&times;96; tensor dims [1, 3, 96, 96]; softmax over the logits.</p>
+</details>
+
+<script>
+"use strict";
+
+/* ==========================================================================
+   0.  CONFIGURATION
+   ========================================================================== */
+
+/* The final public GitHub Pages URL that the QR code must encode.
+   Left empty on purpose in the repository copy: the page then derives the
+   canonical Pages URL from its own location, so the QR can never disagree
+   with the deployed page. Fill it in only if you want to force a value. */
+const APP_URL = "";
+
+const ORT_VERSION = "1.20.1";
+const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@" + ORT_VERSION + "/dist/";
+
+/* Fallbacks, used only if model_info.json cannot be fetched. Identical to the
+   shipped model_info.json, which is the file this page actually reads. */
+const FALLBACK_INFO = {
+  classes: ["apple", "cherry", "chestnut", "maple"],
+  input_size: 96,
+  mean: [0.485, 0.456, 0.406],
+  std: [0.229, 0.224, 0.225]
+};
+
+/* ==========================================================================
+   1.  PRIVACY AUDIT  -  prove that no image ever leaves the device
+   ========================================================================== */
+
+const netLog = [];
+const nativeFetch = window.fetch.bind(window);
+window.fetch = function (input, init) {
+  try {
+    const url = typeof input === "string" ? input : (input && input.url) || String(input);
+    const method = (init && init.method) || (input && input.method) || "GET";
+    const hasBody = !!(init && init.body);
+    netLog.push({ url: new URL(url, location.href).href, method, hasBody });
+  } catch (e) { /* never let the audit break the app */ }
+  return nativeFetch(input, init);
+};
+
+/* ==========================================================================
+   2.  QR CODE ENCODER  -  byte mode, ECC level M, versions 1..6
+   Written into this file so the code is generated in the browser: no external
+   QR-image service is contacted, and the page still works if a CDN is down.
+   ========================================================================== */
+
+const QR = (function () {
+  // Level M only. All entries below have equally sized data blocks, verified
+  // by total === data + blocks * ecc.
+  const SPECS = [
+    { ver: 1, total:  26, data:  16, blocks: 1, ecc: 10, aligns: []        },
+    { ver: 2, total:  44, data:  28, blocks: 1, ecc: 16, aligns: [6, 18]   },
+    { ver: 3, total:  70, data:  44, blocks: 1, ecc: 26, aligns: [6, 22]   },
+    { ver: 4, total: 100, data:  64, blocks: 2, ecc: 18, aligns: [6, 26]   },
+    { ver: 5, total: 134, data:  86, blocks: 2, ecc: 24, aligns: [6, 30]   },
+    { ver: 6, total: 172, data: 108, blocks: 4, ecc: 16, aligns: [6, 34]   }
+  ];
+
+  // --- GF(256) arithmetic, primitive polynomial 0x11d -----------------------
+  const EXP = new Uint8Array(512), LOG = new Uint8Array(256);
+  (function () {
+    let x = 1;
+    for (let i = 0; i < 255; i++) {
+      EXP[i] = x; LOG[x] = i;
+      x <<= 1; if (x & 0x100) x ^= 0x11d;
+    }
+    for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+  })();
+  const gmul = (a, b) => (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]];
+
+  function rsGenerator(n) {                 // product of (x - a^i), i = 0..n-1
+    let g = [1];
+    for (let i = 0; i < n; i++) {
+      const next = new Array(g.length + 1).fill(0);
+      for (let j = 0; j < g.length; j++) {
+        next[j] ^= g[j];                    // g * x
+        next[j + 1] ^= gmul(g[j], EXP[i]);  // g * a^i
+      }
+      g = next;
+    }
+    return g;
+  }
+
+  function rsEncode(data, eccLen) {
+    const gen = rsGenerator(eccLen);
+    const res = new Array(eccLen).fill(0);
+    for (const byte of data) {
+      const factor = byte ^ res[0];
+      res.shift(); res.push(0);
+      if (factor !== 0) {
+        for (let i = 0; i < eccLen; i++) res[i] ^= gmul(gen[i + 1], factor);
+      }
+    }
+    return res;
+  }
+
+  // --- BCH(15,5) format information, generator 0x537, mask 0x5412 -----------
+  function formatBits(mask) {
+    const dataBits = mask;                  // ECC level M is encoded as 0b00
+    let v = dataBits << 10;
+    for (let i = 14; i >= 10; i--) {
+      if ((v >>> i) & 1) v ^= 0x537 << (i - 10);
+    }
+    return (((dataBits << 10) | v) ^ 0x5412) & 0x7fff;
+  }
+
+  const MASKS = [
+    (r, c) => (r + c) % 2 === 0,
+    (r) => r % 2 === 0,
+    (r, c) => c % 3 === 0,
+    (r, c) => (r + c) % 3 === 0,
+    (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+    (r, c) => ((r * c) % 2 + (r * c) % 3) === 0,
+    (r, c) => (((r * c) % 2) + ((r * c) % 3)) % 2 === 0,
+    (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0
+  ];
+
+  function penalty(m, size) {
+    let p = 0;
+    // rule 1: runs of five or more identical modules in rows and columns
+    for (let line = 0; line < size; line++) {
+      for (const get of [ (i) => m[line][i], (i) => m[i][line] ]) {
+        let run = 1;
+        for (let i = 1; i < size; i++) {
+          if (get(i) === get(i - 1)) { run++; }
+          else { if (run >= 5) p += 3 + (run - 5); run = 1; }
+        }
+        if (run >= 5) p += 3 + (run - 5);
+      }
+    }
+    // rule 2: 2x2 blocks of one colour
+    for (let r = 0; r < size - 1; r++) {
+      for (let c = 0; c < size - 1; c++) {
+        const v = m[r][c];
+        if (v === m[r][c + 1] && v === m[r + 1][c] && v === m[r + 1][c + 1]) p += 3;
+      }
+    }
+    // rule 3: finder-like 1:1:3:1:1 pattern with 4 light modules beside it
+    const A = [true, false, true, true, true, false, true, false, false, false, false];
+    const B = [false, false, false, false, true, false, true, true, true, false, true];
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c <= size - 11; c++) {
+        let a = true, b = true;
+        for (let k = 0; k < 11; k++) {
+          if (m[r][c + k] !== A[k]) a = false;
+          if (m[r][c + k] !== B[k]) b = false;
+        }
+        if (a) p += 40;
+        if (b) p += 40;
+      }
+    }
+    for (let c = 0; c < size; c++) {
+      for (let r = 0; r <= size - 11; r++) {
+        let a = true, b = true;
+        for (let k = 0; k < 11; k++) {
+          if (m[r + k][c] !== A[k]) a = false;
+          if (m[r + k][c] !== B[k]) b = false;
+        }
+        if (a) p += 40;
+        if (b) p += 40;
+      }
+    }
+    // rule 4: proportion of dark modules
+    let dark = 0;
+    for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) if (m[r][c]) dark++;
+    const pct = (dark * 100) / (size * size);
+    p += Math.floor(Math.abs(pct - 50) / 5) * 10;
+    return p;
+  }
+
+  function buildMatrix(spec, codewords, remainderBits, maskIdx) {
+    const size = spec.ver * 4 + 17;
+    const mod = Array.from({ length: size }, () => new Array(size).fill(false));
+    const fixed = Array.from({ length: size }, () => new Array(size).fill(false));
+    const setFixed = (r, c, v) => { mod[r][c] = v; fixed[r][c] = true; };
+    const reserve = (r, c) => { fixed[r][c] = true; };
+
+    // finder patterns + separators
+    const finder = (row0, col0) => {
+      for (let r = -1; r <= 7; r++) {
+        for (let c = -1; c <= 7; c++) {
+          const rr = row0 + r, cc = col0 + c;
+          if (rr < 0 || rr >= size || cc < 0 || cc >= size) continue;
+          const inside = r >= 0 && r <= 6 && c >= 0 && c <= 6;
+          let dark = false;
+          if (inside) {
+            const ring = r === 0 || r === 6 || c === 0 || c === 6;
+            const core = r >= 2 && r <= 4 && c >= 2 && c <= 4;
+            dark = ring || core;
+          }
+          setFixed(rr, cc, dark);
+        }
+      }
+    };
+    finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+
+    // timing patterns
+    for (let i = 8; i < size - 8; i++) {
+      setFixed(6, i, i % 2 === 0);
+      setFixed(i, 6, i % 2 === 0);
+    }
+
+    // alignment patterns
+    const a = spec.aligns;
+    for (const ar of a) {
+      for (const ac of a) {
+        const nearFinder =
+          (ar === a[0] && ac === a[0]) ||
+          (ar === a[0] && ac === a[a.length - 1]) ||
+          (ar === a[a.length - 1] && ac === a[0]);
+        if (nearFinder) continue;
+        for (let dr = -2; dr <= 2; dr++) {
+          for (let dc = -2; dc <= 2; dc++) {
+            setFixed(ar + dr, ac + dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1);
+          }
+        }
+      }
+    }
+
+    // format-information areas + the always-dark module
+    for (let i = 0; i <= 8; i++) {
+      if (i !== 6) { reserve(8, i); reserve(i, 8); }
+    }
+    for (let i = 0; i < 8; i++) reserve(8, size - 1 - i);
+    for (let i = 0; i < 8; i++) reserve(size - 1 - i, 8);
+
+    // data placement: zig-zag in two-module-wide columns, skipping column 6
+    const maskFn = MASKS[maskIdx];
+    const totalBits = codewords.length * 8 + remainderBits;
+    let bitIdx = 0, dir = -1, row = size - 1;
+    const nextBit = () => {
+      if (bitIdx >= totalBits) return false;
+      const byte = codewords[bitIdx >> 3];
+      const bit = (byte >> (7 - (bitIdx & 7))) & 1;
+      bitIdx++;
+      return bit === 1;
+    };
+    for (let col = size - 1; col > 0; col -= 2) {
+      if (col === 6) col = 5;
+      for (;;) {
+        for (let k = 0; k < 2; k++) {
+          const cc = col - k;
+          if (!fixed[row][cc]) mod[row][cc] = nextBit() !== maskFn(row, cc);
+        }
+        row += dir;
+        if (row < 0 || row >= size) { row -= dir; dir = -dir; break; }
+      }
+    }
+
+    // Format information, written twice (ISO/IEC 18004 Figure 25). Bit i counts
+    // from the least significant end. Copy 1 runs down column 8 beside the top
+    // left finder and continues in that column by the bottom-left finder;
+    // copy 2 runs along row 8, rightwards from the top-left finder to the
+    // top-right one. (Getting these two strips the wrong way round is the
+    // classic bug: the symbol then looks fine but no decoder accepts it.)
+    const fmt = formatBits(maskIdx);
+    for (let i = 0; i < 15; i++) {
+      const bit = ((fmt >>> i) & 1) === 1;
+      if (i < 6) mod[i][8] = bit;                  // column 8, rows 0..5
+      else if (i < 8) mod[i + 1][8] = bit;         // rows 7 and 8 (row 6 is timing)
+      else mod[size - 15 + i][8] = bit;            // rows size-7 .. size-1
+
+      if (i < 8) mod[8][size - 1 - i] = bit;       // row 8, cols size-1 .. size-8
+      else if (i === 8) mod[8][7] = bit;
+      else mod[8][14 - i] = bit;                   // cols 5 .. 0
+    }
+    mod[size - 8][8] = true;                       // dark module
+    return mod;
+  }
+
+  function encode(text) {
+    const bytes = new TextEncoder().encode(text);
+    const spec = SPECS.find(s => 4 + 8 + 8 * bytes.length <= s.data * 8);
+    if (!spec) throw new Error("URL too long for the built-in QR encoder (max 106 bytes)");
+
+    // --- bit stream: mode 0100 (byte) + 8-bit length + payload -------------
+    const bits = [];
+    const push = (value, len) => {
+      for (let i = len - 1; i >= 0; i--) bits.push((value >>> i) & 1);
+    };
+    push(0b0100, 4);
+    push(bytes.length, 8);
+    for (const b of bytes) push(b, 8);
+    const capacityBits = spec.data * 8;
+    for (let i = 0; i < 4 && bits.length < capacityBits; i++) bits.push(0);  // terminator
+    while (bits.length % 8 !== 0) bits.push(0);                               // byte align
+    const data = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      let v = 0; for (let k = 0; k < 8; k++) v = (v << 1) | bits[i + k];
+      data.push(v);
+    }
+    const PADS = [0xEC, 0x11];
+    for (let i = 0; data.length < spec.data; i++) data.push(PADS[i % 2]);
+
+    // --- blocks, Reed-Solomon, interleaving --------------------------------
+    const per = spec.data / spec.blocks;
+    const dBlocks = [], eBlocks = [];
+    for (let b = 0; b < spec.blocks; b++) {
+      const chunk = data.slice(b * per, (b + 1) * per);
+      dBlocks.push(chunk);
+      eBlocks.push(rsEncode(chunk, spec.ecc));
+    }
+    const codewords = [];
+    for (let i = 0; i < per; i++) for (let b = 0; b < spec.blocks; b++) codewords.push(dBlocks[b][i]);
+    for (let i = 0; i < spec.ecc; i++) for (let b = 0; b < spec.blocks; b++) codewords.push(eBlocks[b][i]);
+    const remainderBits = spec.ver === 1 ? 0 : 7;
+
+    // --- pick the mask with the lowest penalty -----------------------------
+    let best = null, bestPenalty = Infinity;
+    for (let m = 0; m < 8; m++) {
+      const candidate = buildMatrix(spec, codewords, remainderBits, m);
+      const p = penalty(candidate, candidate.length);
+      if (p < bestPenalty) { bestPenalty = p; best = candidate; }
+    }
+    return best;
+  }
+
+  // Draw with a 4-module quiet zone; scannability depends on it.
+  function draw(canvas, text, targetPx) {
+    const m = encode(text);
+    const n = m.length, quiet = 4, size = n + quiet * 2;
+    const scale = Math.max(2, Math.floor(targetPx / size));
+    const px = size * scale;
+    canvas.width = px; canvas.height = px;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, px, px);
+    ctx.fillStyle = "#000000";
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        if (m[r][c]) ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+      }
+    }
+    return { version: (n - 17) / 4, modules: n, pixelSize: px };
+  }
+
+  return { encode, draw };
+})();
+
+/* ==========================================================================
+   3.  PAGE STATE
+   ========================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const barsEl = $("bars");
+const camStatus = $("camStatus"), inferStatus = $("inferStatus");
+const fileStatus = $("fileStatus"), checkOut = $("checkOut");
+
+let info = null;             // model_info.json contents
+let session = null;          // ort.InferenceSession
+let INPUT_NAME = null, OUTPUT_NAME = null;
+let stream = null;           // MediaStream
+let running = false;         // camera loop requested
+let busy = false;            // one inference at a time
+let frameCount = 0, fpsMark = performance.now();
+let lastProbs = null;
+
+const work = document.createElement("canvas");
+const workCtx = work.getContext("2d", { willReadFrequently: true });
+
+const setStatus = (el, msg, cls) => { el.textContent = msg; el.className = "status" + (cls ? " " + cls : ""); };
+
+function softmax(logits) {
+  const mx = Math.max.apply(null, logits);
+  const ex = logits.map(v => Math.exp(v - mx));
+  const sum = ex.reduce((a, b) => a + b, 0);
+  return ex.map(v => v / sum);
+}
+
+/* ==========================================================================
+   4.  MODEL + MODEL INFO
+   ========================================================================== */
+
+async function loadJSON(path) {
+  const r = await nativeFetch(path, { cache: "no-cache" });
+  if (!r.ok) throw new Error(path + " -> HTTP " + r.status);
+  return r.json();
+}
+
+async function initModel() {
+  try {
+    info = await loadJSON("model_info.json");
+  } catch (e) {
+    info = FALLBACK_INFO;
+    setStatus(inferStatus, "model_info.json unavailable, using the identical built-in copy.", "err");
+  }
+  if (!info.classes || !info.input_size || !info.mean || !info.std) {
+    throw new Error("model_info.json is missing one of classes/input_size/mean/std");
+  }
+  $("infoEcho").textContent =
+    "classes=[" + info.classes.join(", ") + "]  input_size=" + info.input_size +
+    "  mean=[" + info.mean.join(", ") + "]  std=[" + info.std.join(", ") + "]";
+
+  barsEl.innerHTML = info.classes.map((name, i) => `
+    <div class="bar" id="bar${i}">
+      <div class="barhead"><span class="nm">${name}</span><span class="pc" id="pc${i}">—</span></div>
+      <div class="track"><div class="fill" id="fill${i}"></div></div>
+    </div>`).join("");
+
+  setStatus(inferStatus, "Loading the ONNX Runtime WASM engine from the CDN…");
+  await loadOrtScript(ORT_BASE + "ort.min.js");
+  // GitHub Pages does not send COOP/COEP headers, so SharedArrayBuffer is not
+  // available here. Pinning to one thread avoids the threaded-WASM path that
+  // would otherwise fail (notably on iOS Safari).
+  ort.env.wasm.wasmPaths = ORT_BASE;
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy = false;
+
+  setStatus(inferStatus, "Downloading the model (6.3 MB, same origin)…");
+  const modelBytes = new Uint8Array(await (await nativeFetch("leaf_model.onnx")).arrayBuffer());
+
+  setStatus(inferStatus, "Compiling the model…");
+  session = await ort.InferenceSession.create(modelBytes, {
+    executionProviders: ["wasm"],
+    graphOptimizationLevel: "all"
+  });
+  INPUT_NAME = session.inputNames[0];
+  OUTPUT_NAME = session.outputNames[0];
+  setStatus(inferStatus,
+    "Model ready. input tensor “" + INPUT_NAME + "”, output “" + OUTPUT_NAME +
+    "” (" + info.input_size + "×" + info.input_size + ", softmax applied to its logits).", "ok");
+}
+
+function loadOrtScript(src) {
+  return new Promise((resolve, reject) => {
+    if (window.ort) return resolve();
+    const s = document.createElement("script");
+    s.src = src; s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("Could not load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+/* ==========================================================================
+   5.  PREPROCESSING - the part that has to match the training transform
+   ========================================================================== */
+
+/**
+ * Central square -> input_size x input_size -> /255 -> (x-mean)/std -> CHW.
+ * @param {HTMLVideoElement|HTMLImageElement} source
+ * @param {number} srcW  intrinsic width of the source
+ * @param {number} srcH  intrinsic height of the source
+ * @returns {Float32Array} 3 * size * size planar CHW values
+ */
+function preprocess(source, srcW, srcH) {
+  const size = info.input_size;
+
+  // (a) central square of the frame. The offset is floored, the way
+  // torchvision's CenterCrop does it, so an odd-sized frame gives the same
+  // pixel grid rather than a half-pixel shift.
+  const side = Math.min(srcW, srcH);
+  const sx = Math.floor((srcW - side) / 2);
+  const sy = Math.floor((srcH - side) / 2);
+
+  // (b) crop + resize in one drawImage into a size x size canvas
+  if (work.width !== size || work.height !== size) { work.width = size; work.height = size; }
+  workCtx.drawImage(source, sx, sy, side, side, 0, 0, size, size);
+  const rgba = workCtx.getImageData(0, 0, size, size).data;   // R G B A bytes
+
+  // (c) bytes -> 0..1 -> per-channel standardisation, written planar CHW
+  const plane = size * size;
+  const tensorData = new Float32Array(3 * plane);
+  for (let c = 0; c < 3; c++) {
+    const mean = info.mean[c], std = info.std[c], offset = c * plane;
+    for (let i = 0; i < plane; i++) {
+      const value = rgba[i * 4 + c] / 255;          // R,G,B are channels 0,1,2
+      tensorData[offset + i] = (value - mean) / std;
+    }
+  }
+  return tensorData;
+}
+
+async function classify(source, srcW, srcH) {
+  const size = info.input_size;
+  const tensor = new ort.Tensor("float32", preprocess(source, srcW, srcH), [1, 3, size, size]);
+  const results = await session.run({ [INPUT_NAME]: tensor });
+  const out = results[OUTPUT_NAME].data;                          // logits
+  return softmax(Array.prototype.slice.call(out, 0, info.classes.length));
+}
+
+function showProbs(probs) {
+  lastProbs = probs;
+  let best = 0;
+  for (let i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
+  for (let i = 0; i < probs.length; i++) {
+    $("pc" + i).textContent = (probs[i] * 100).toFixed(1) + "%";
+    $("fill" + i).style.width = (probs[i] * 100).toFixed(2) + "%";
+    $("bar" + i).classList.toggle("top", i === best);
+  }
+}
+
+/* ==========================================================================
+   6.  LIVE CAMERA
+   ========================================================================== */
+
+function cameraSupported() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+
+async function startCamera() {
+  if (!cameraSupported()) {
+    setStatus(camStatus,
+      "getUserMedia is unavailable. It needs HTTPS and a modern browser - open the " +
+      "GitHub Pages URL, or use the photo button below.", "err");
+    return;
+  }
+  setStatus(camStatus, "Asking for camera permission…");
+  const attempts = [
+    { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 1280 } }, audio: false },
+    { video: { facingMode: "environment" }, audio: false },
+    { video: true, audio: false }
+  ];
+  let lastError = null;
+  for (const constraints of attempts) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      lastError = null; break;
+    } catch (err) { lastError = err; }
+  }
+  if (lastError) {
+    setStatus(camStatus, "Camera refused: " + lastError.name + " – " + lastError.message +
+      ". The photo button below works instead.", "err");
+    return;
+  }
+  video.srcObject = stream;
+  video.setAttribute("playsinline", "");        // iOS Safari: stay inline
+  try { await video.play(); } catch (e) {
+    if (video.paused) setStatus(camStatus, "Tap Start camera again to begin playback.", "err");
+  }
+  $("startBtn").disabled = true;
+  $("stopBtn").disabled = false;
+  running = true;
+  const track = stream.getVideoTracks()[0];
+  const settings = track && track.getSettings ? track.getSettings() : {};
+  setStatus(camStatus, "Live" + (settings.facingMode ? " · camera: " + settings.facingMode : "") +
+    " · source " + video.videoWidth + "×" + video.videoHeight, "ok");
+  requestFrame();
+}
+
+function stopCamera() {
+  running = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.pause();
+  video.srcObject = null;
+  $("startBtn").disabled = false;
+  $("stopBtn").disabled = true;
+  setStatus(camStatus, "Camera is off.");
+  if (!busy) setStatus(inferStatus, "Camera stopped. Last prediction kept on screen.");
+}
+
+function videoReady() {
+  return video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+}
+
+async function tick() {
+  if (!running) return;
+  if (busy || !videoReady()) { requestFrame(); return; }
+  busy = true;
+  try {
+    showProbs(await classify(video, video.videoWidth, video.videoHeight));
+    frameCount++;
+    const now = performance.now();
+    if (now - fpsMark > 1000) {
+      const fps = (frameCount * 1000) / (now - fpsMark);
+      setStatus(inferStatus, "Live · " + fps.toFixed(1) + " predictions/s · " +
+        info.input_size + "×" + info.input_size + " central crop · everything on-device", "ok");
+      frameCount = 0; fpsMark = now;
+    }
+  } catch (err) {
+    setStatus(inferStatus, "Inference error: " + err.message, "err");
+    running = false;
+  } finally {
+    busy = false;
+  }
+  requestFrame();
+}
+
+// requestVideoFrameCallback (Safari 12.1+, Chrome) hands us each decoded frame
+// exactly once; fall back to requestAnimationFrame elsewhere.
+function requestFrame() {
+  if (!running) return;
+  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+    video.requestVideoFrameCallback(() => tick());
+  } else {
+    requestAnimationFrame(() => tick());
+  }
+}
+
+/* ==========================================================================
+   7.  PHOTO FALLBACK
+   ========================================================================== */
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not decode that image.")); };
+    img.src = url;
+  });
+}
+
+async function onFilePicked(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  if (!session) { setStatus(fileStatus, "The model is still loading, try again in a second.", "err"); return; }
+  setStatus(fileStatus, "Decoding " + file.name + " locally…");
+  try {
+    const img = await loadImage(file);
+    const probs = await classify(img, img.naturalWidth, img.naturalHeight);
+    showProbs(probs);
+    const best = info.classes[probs.indexOf(Math.max.apply(null, probs))];
+    setStatus(fileStatus, file.name + " (" + img.naturalWidth + "×" + img.naturalHeight +
+      ", central square used) → " + best +
+      " · " + probs.map((p, i) => info.classes[i] + " " + (p * 100).toFixed(3) + "%").join(" · "), "ok");
+  } catch (err) {
+    setStatus(fileStatus, err.message, "err");
+  }
+  event.target.value = "";
+}
+
+/* ==========================================================================
+   8.  BUILT-IN SELF-CHECK  (requirement: same numbers as the notebook)
+   ========================================================================== */
+
+async function runSelfCheck() {
+  if (!session) { checkOut.textContent = "The model is still loading — one moment."; return; }
+  checkOut.textContent = "Loading check_image.jpg and check_expected.json…";
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error("check_image.jpg could not be decoded"));
+      i.src = "check_image.jpg?_=" + Date.now();
+    });
+    const expected = await loadJSON("check_expected.json");
+    const probs = await classify(img, img.naturalWidth, img.naturalHeight);
+
+    let worst = 0;
+    let rows = "";
+    info.classes.forEach((name, i) => {
+      const exp = expected[name];
+      const diff = Math.abs(probs[i] - exp);
+      worst = Math.max(worst, diff);
+      rows += `<tr><td>${name}</td><td>${probs[i].toFixed(6)}</td><td>${exp.toFixed(6)}</td>
+               <td>${diff.toFixed(6)}</td><td>${diff < 0.0005 ? "✓" : "✗"}</td></tr>`;
+    });
+    const pass = worst < 0.0005;
+    checkOut.innerHTML = `
+      <table>
+        <thead><tr><th>class</th><th>this page</th><th>check_expected.json</th>
+        <th>|difference|</th><th>3 dp</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p class="note" style="margin:10px 0 0">
+        <span class="pill ${pass ? "pass" : "fail"}">${pass ? "MATCH at 3 decimals" : "NO MATCH"}</span>
+        &nbsp;largest absolute difference <strong>${worst.toFixed(6)}</strong> on
+        ${img.naturalWidth}×${img.naturalHeight} input.
+      </p>`;
+  } catch (err) {
+    checkOut.innerHTML = '<span class="pill fail">FAILED</span> <span class="note">' +
+      err.message + "</span>";
+  }
+}
+
+/* ==========================================================================
+   9.  PRIVACY AUDIT PANEL
+   ========================================================================== */
+
+function showAudit() {
+  const seen = new Set();
+  const items = [];
+  performance.getEntriesByType("resource").forEach(e => seen.add(e.name));
+  document.querySelectorAll("script[src]").forEach(s => seen.add(new URL(s.src, location.href).href));
+  netLog.forEach(n => seen.add(n.url));
+  [...seen].sort().forEach(u => items.push(u));
+
+  const uploads = netLog.filter(n => n.hasBody || (n.method && n.method.toUpperCase() !== "GET"));
+  $("auditOut").innerHTML = `
+    <span class="pill ${uploads.length ? "fail" : "pass"}">
+      ${uploads.length ? uploads.length + " REQUEST(S) WITH A BODY" : "NO UPLOADS"}
+    </span>
+    <span class="note"> &nbsp;${netLog.length} fetch() call(s), all GET, all below.</span>
+    <ul class="urls">${items.map(u => `<li>${u}</li>`).join("")}</ul>
+    <p class="note">Camera frames and photos are converted to a Float32Array and handed to
+    the WASM session in the same JavaScript context; they are never serialised and never
+    passed to <span class="mono">fetch()</span>, <span class="mono">XMLHttpRequest</span>,
+    a WebSocket or a form.</p>`;
+}
+
+/* ==========================================================================
+   10.  QR CODE FOR THE DEPLOYED URL
+   ========================================================================== */
+
+function pagesUrl() {
+  if (APP_URL) return APP_URL;
+  // Derive the canonical Pages URL from where the page is actually served:
+  // https://<user>.github.io/<repo>/<anything>  ->  https://<user>.github.io/<repo>/
+  try {
+    const u = new URL(location.href);
+    if (/\.github\.io$/.test(u.hostname)) {
+      const first = u.pathname.split("/").filter(Boolean)[0] || "";
+      return u.origin + "/" + first + "/";
+    }
+  } catch (e) { /* fall through */ }
+  return location.origin + location.pathname;
+}
+
+function renderQr() {
+  const url = pagesUrl();
+  const canvas = $("qr");
+  try {
+    const meta = QR.draw(canvas, url, 296);
+    $("qrUrlText").textContent = url;
+    const link = $("qrLink");
+    link.href = url; link.textContent = url;
+    const same = url.replace(/\/+$/, "") === location.href.replace(/\/+$/, "").split(/[?#]/)[0];
+    $("qrMatch").innerHTML = same
+      ? '<span class="pill pass">MATCHES THIS PAGE</span> <span class="note">encoded QR URL = ' +
+        'the URL you are reading (QR ' + meta.version + "×" + meta.modules + " modules, ECC level M, " +
+        meta.pixelSize + "×" + meta.pixelSize + " px)</span>"
+      : '<span class="note">QR encodes <strong>' + url + '</strong>; you are currently reading ' +
+        '<span class="mono">' + location.href + '</span>.</span>';
+  } catch (err) {
+    $("qrUrlText").textContent = url + " — QR failed: " + err.message;
+  }
+}
+
+/* Proof that the canvas really encodes the URL it claims: ask the browser's
+   own barcode reader to read the picture back. Graceful when unsupported. */
+async function scanOwnQr() {
+  const out = $("qrScanOut");
+  const url = pagesUrl();
+  if (!("BarcodeDetector" in window)) {
+    out.innerHTML = '<span class="note">This browser cannot read barcodes itself, so the ' +
+      "page cannot verify its own picture. Scan it with a phone camera instead; it encodes " +
+      '<span class="mono">' + url + "</span>.</span>";
+    return;
+  }
+  try {
+    const found = await new BarcodeDetector({ formats: ["qr_code"] }).detect($("qr"));
+    if (found.length && found[0].rawValue === url) {
+      out.innerHTML = '<span class="pill pass">DECODED OK</span> <span class="note">the ' +
+        'browser read “' + found[0].rawValue + '” back out of the canvas.</span>';
+    } else if (found.length) {
+      out.innerHTML = '<span class="pill fail">WRONG URL</span> <span class="note">decoded “' +
+        found[0].rawValue + '”, expected “' + url + "”.</span>";
+    } else {
+      out.innerHTML = '<span class="pill fail">NOT READABLE</span> <span class="note">' +
+        "the decoder found nothing in the picture.</span>";
+    }
+  } catch (err) {
+    out.innerHTML = '<span class="note">Decoder error: ' + err.message + "</span>";
+  }
+}
+
+/* ==========================================================================
+   11.  BOOT
+   ========================================================================== */
+
+$("startBtn").addEventListener("click", startCamera);
+$("stopBtn").addEventListener("click", stopCamera);
+$("fileInput").addEventListener("change", onFilePicked);
+$("checkBtn").addEventListener("click", runSelfCheck);
+$("auditBtn").addEventListener("click", showAudit);
+$("qrScanBtn").addEventListener("click", scanOwnQr);
+document.addEventListener("visibilitychange", () => { if (document.hidden && running) stopCamera(); });
+
+renderQr();
+
+// Open the page as  ?selfcheck  to run the number check and the QR read-back
+// without touching anything (handy on a phone, and for automated checks).
+const wantsSelfCheck = /[?&]selfcheck\b/.test(location.search);
+
+if (location.protocol === "file:") {
+  setStatus(inferStatus,
+    "This page was opened from the disk. Browsers block the camera and the model file " +
+    "that way - open the GitHub Pages URL instead.", "err");
+} else {
+  initModel()
+    .then(() => {
+      if (wantsSelfCheck) {
+        runSelfCheck().then(showAudit).then(scanOwnQr);
+      }
+    })
+    .catch(err => setStatus(inferStatus, "Startup failed: " + err.message, "err"));
+}
+</script>
+</body>
+</html>
